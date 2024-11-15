@@ -62,7 +62,7 @@ class ModelArgs:
     n_layers: int = 8       # number of model decoder block
     n_heads: int = 8        # number of heads for queires embedding
     n_kv_heads: int = 4     # number of heads for keys and values embedding
-    #vocab_size: int = len(vocab)       # length of vocabulary(has been defined above)
+    vocab_size: int = len(vocab)       # length of vocabulary(has been defined above)
     multiple_of: int = 256      # require to calculate dim of feedforward network
     ffn_dim_multiplier: Optional[float] = None      # require to calculate dim of feedforward network
     norm_eps: float = 1e-5      # default epsilon value set for the RMSNorm calculation
@@ -333,7 +333,108 @@ x_out = feed_forward(x_out)
 print(f"\nfeed forward output: x_out.shape: {x_out.shape}\n")
 
 ## f. Decoder Block
+
+class TransformerBlock(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        # initilizate RMSNorm for attention
+        self.attention_norm = RMSNorm(dim=args.dim, eps=args.norm_eps)
+        # init Attention class
+        self.attention = Attention(args)
+        # init RMSNorm for feedfoward class
+        self.ff_norm = RMSNorm(dim=args.dim, eps=args.norm_eps)
+        # init feedfoward class
+        self.feedforward = FeedForward(args.dim, 4 * args.dim, args.multiple_of, args.ffn_dim_multiplier)
     
+    def forward(self, x, start_pos, inference):
+        h = x + self.attention(self.attention_norm(x), start_pos, inference)
+        out = h + self.feedforward(self.ff_norm(h))
+        return out
+    
+## test: TransformerBlock
+x = torch.randn((ModelArgs.max_bach_size, ModelArgs.max_seq_len, ModelArgs.dim), device=device)
+transformer_block = TransformerBlock(ModelArgs)
+transformer_block_out = transformer_block(x, start_pos=0, inference=False)
+print(f"\ntransformer_block_out.shape: {transformer_block_out.shape}\n")
 
+### step3. The Output Block ###
 
-            
+class Transformer(nn.Module):
+    def __init__(self, params: ModelArgs):
+        super().__init__()
+        self.parames = params
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        
+        # init the decode block and store it inside the ModuleList
+        self.layers = nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(TransformerBlock(args=params))
+
+        # init RMSNorm for the output block
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+
+        # init linear layer at the output block
+        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+
+    def forward(self, x, start_pos=0, targets=None):
+        h = self.tok_embeddings(x)
+
+        # if target is none, inference mode is activated and set to true
+        if targets is None:
+            inference = True
+        else:
+            inference = False
+
+        for layer in self.layers:
+            h = layer(h, start_pos, inference)
+
+        h = self.norm(h)
+
+        logits = self.output(h).float()
+        loss = None
+
+        if targets is None:
+            loss = None
+        else:
+            loss = F.cross_entropy(logits.view(-1, self.parames.vocab_size), targets.view(-1))
+
+        return logits, loss
+
+## test: Transformer
+model = Transformer(ModelArgs).to(ModelArgs.device)
+print(f"\n {model}\n")
+
+### step4. Train Model
+
+# create a datset
+dataset = torch.tensor(encode(data), dtype=torch.int).to(ModelArgs.device)
+print(f"\ndataset-shape: {dataset.shape}\n")
+
+# generate bathces from the dataset
+def get_dataset_batch(data, split, args:ModelArgs):
+    seq_len = args.max_seq_len
+    batch_size = args.max_bach_size
+    device = args.device
+
+    train = data[:int(0.8 * len(data))]
+    val = data[int(0.8 * len(data)): int(0.9 * len(data))]
+    test = data[int(0.9 * len(data)):]
+
+    batch_data = train
+    if split == "val":
+        batch_data = val
+
+    if split == "test":
+        batch_data = test
+
+    # pick random starting poins from dataset to give random samples for t/v/t
+    ix = torch.randint(0, len(batch_data) - seq_len - 3, (batch_size,)).to(device)
+    x = torch.stack([torch.cat([token_bos, batch_data[i:i+seq_len-1]]) for i in ix]).long().to(device)
+    y = torch.stack([torch.cat([batch_data[i+1:i+seq_len], token_eos]) for i in ix]).long().to(device)
+
+    return x, y
+
+## test: get_dataset func
+xs, ys = get_dataset_batch(dataset, split="train", args=ModelArgs)
+print("\n", [(decode(xs[i].tolist()), decode(ys[i].tolist())) for i in range(len(xs))], "\n")
